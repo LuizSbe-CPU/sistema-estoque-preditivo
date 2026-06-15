@@ -1,82 +1,93 @@
 import streamlit as st
 import pandas as pd
-from supabase import create_client, Client
+from supabase import create_client
 import segno
 
-st.set_page_config(page_title="Painel União Comercial", layout="wide")
+# --- CONFIGURAÇÃO ---
+st.set_page_config(page_title="União Comercial", layout="wide")
 
-# Conexão Supabase
+# Conexão Supabase (Lendo do Secrets)
 url = st.secrets["SUPABASE_URL"]
 key = st.secrets["SUPABASE_KEY"]
 supabase = create_client(url, key)
 
 # --- LOGIN ---
-if "logado" not in st.session_state: st.session_state.logado = False
+if "logado" not in st.session_state:
+    st.session_state.logado = False
+
 if not st.session_state.logado:
     st.title("🔐 Login União Comercial")
-    u, p = st.text_input("Usuário:"), st.text_input("Senha:", type="password")
-    if st.button("Entrar") and u == "admin" and p == "123":
-        st.session_state.logado = True
-        st.rerun()
-    st.stop()
+    u = st.text_input("Usuário:")
+    p = st.text_input("Senha:", type="password")
+    if st.button("Entrar"):
+        if u == "admin" and p == "123":
+            st.session_state.logado = True
+            st.rerun()
+        else:
+            st.error("Usuário ou senha incorretos!")
+    st.stop() # Bloqueia o resto do app se não estiver logado
 
 # --- FUNÇÕES ---
 def buscar_dados_pix():
-    try: return supabase.table("dados_pix").select("*").eq("id", 1).execute().data[0]
+    try:
+        data = supabase.table("dados_pix").select("*").eq("id", 1).execute().data
+        return data[0] if data else {"chave_pix": "", "nome_titular": "", "cidade_titular": ""}
     except: return {"chave_pix": "", "nome_titular": "", "cidade_titular": ""}
 
-def atualizar_dados_pix(chave, titular, city):
-    supabase.table("dados_pix").update({"chave_pix": chave, "nome_titular": titular, "cidade_titular": city}).eq("id", 1).execute()
-
-def gerar_payload_pix(chave, titular, city, valor):
-    t, c = titular.strip().upper(), city.strip().upper()
-    return f"00020101021126360014br.gov.bcb.pix0114{chave.strip()}5204000053039865405{valor:.2f}5802BR59{len(t):02d}{t}60{len(c):02d}{c}62070503***6304"
-
 def buscar_produtos():
-    return supabase.table("produtos").select("*").order("nome_produto").execute().data
+    try:
+        return supabase.table("produtos").select("*").order("nome_produto").execute().data
+    except Exception as e:
+        st.error(f"Erro ao buscar produtos: {e}")
+        return []
 
 # --- MENU ---
 st.sidebar.title("🏪 União Comercial")
-menu = st.sidebar.radio("Navegar:", ["🛒 Frente de Caixa (PDV)", "📦 Importação em Lote", "⚙️ Configurações do PIX"])
+menu = st.sidebar.radio("Navegar para:", ["🛒 Frente de Caixa (PDV)", "📦 Importação em Lote", "⚙️ Configurações do PIX"])
 
-if menu == "⚙️ Configurações do PIX":
-    st.title("⚙️ Configurações PIX")
-    d = buscar_dados_pix()
-    with st.form("p"):
-        c, t, ci = st.text_input("Chave", d["chave_pix"]), st.text_input("Titular", d["nome_titular"]), st.text_input("Cidade", d["cidade_titular"])
-        if st.form_submit_button("Salvar"):
-            atualizar_dados_pix(c, t, ci)
-            st.success("Salvo!")
-
-elif menu == "🛒 Frente de Caixa (PDV)":
+# --- PDV ---
+if menu == "🛒 Frente de Caixa (PDV)":
     st.title("🛒 Frente de Caixa")
     if "carrinho" not in st.session_state: st.session_state.carrinho = []
-    prods = buscar_produtos()
-    sel = st.selectbox("Produto", [p["nome_produto"] for p in prods])
-    p_sel = next(p for p in prods if p["nome_produto"] == sel)
-    qnt = st.number_input("Quantidade", 1, p_sel["estoque_atual"])
-    if st.button("Adicionar"):
-        st.session_state.carrinho.append({"id": p_sel["id"], "nome": p_sel["nome_produto"], "preco": p_sel["preco"], "qnt": qnt})
     
+    produtos = buscar_produtos()
+    if produtos:
+        nomes = [p["nome_produto"] for p in produtos]
+        sel = st.selectbox("Selecione o Produto:", nomes)
+        prod = next(p for p in produtos if p["nome_produto"] == sel)
+        qnt = st.number_input("Quantidade", min_value=1, value=1)
+        
+        if st.button("Adicionar ao Carrinho"):
+            st.session_state.carrinho.append({"id": prod["id"], "nome": prod["nome_produto"], "preco": prod["preco"], "qnt": qnt})
+            st.rerun()
+
     if st.session_state.carrinho:
         df = pd.DataFrame(st.session_state.carrinho)
         st.dataframe(df)
         total = (df["preco"] * df["qnt"]).sum()
-        if st.button("Finalizar Venda"):
-            for item in st.session_state.carrinho:
-                supabase.table("produtos").update({"estoque_atual": (next(p for p in prods if p["id"] == item["id"])["estoque_atual"] - item["qnt"])}).eq("id", item["id"]).execute()
-            st.session_state.carrinho = []
-            st.success("Venda Finalizada!")
+        st.subheader(f"Total: R$ {total:.2f}")
 
+# --- IMPORTAÇÃO ---
 elif menu == "📦 Importação em Lote":
     st.title("📦 Importação de Produtos")
     file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
-    if file:
+    if file and st.button("Processar Arquivo"):
         df = pd.read_csv(file) if file.name.endswith(".csv") else pd.read_excel(file)
-        if st.button("Processar"):
-            for _, r in df.iterrows():
-                dados = {"nome_produto": r["nome_produto"], "preco": float(r["preco"]), "estoque_atual": int(r["estoque_atual"])}
-                existe = supabase.table("produtos").select("id").eq("nome_produto", r["nome_produto"]).execute()
-                if existe.data: supabase.table("produtos").update(dados).eq("id", existe.data[0]["id"]).execute()
-                else: supabase.table("produtos").insert(dados).execute()
-            st.success("Importado com sucesso!")
+        for _, r in df.iterrows():
+            dados = {"nome_produto": r["nome_produto"], "preco": float(r["preco"]), "estoque_atual": int(r["estoque_atual"])}
+            existe = supabase.table("produtos").select("id").eq("nome_produto", r["nome_produto"]).execute()
+            if existe.data: supabase.table("produtos").update(dados).eq("id", existe.data[0]["id"]).execute()
+            else: supabase.table("produtos").insert(dados).execute()
+        st.success("Importado com sucesso!")
+
+# --- CONFIG PIX ---
+elif menu == "⚙️ Configurações do PIX":
+    st.title("⚙️ Configurações PIX")
+    d = buscar_dados_pix()
+    with st.form("form_pix"):
+        c = st.text_input("Chave PIX", value=d["chave_pix"])
+        t = st.text_input("Titular", value=d["nome_titular"])
+        ci = st.text_input("Cidade", value=d["cidade_titular"])
+        if st.form_submit_button("Salvar"):
+            supabase.table("dados_pix").update({"chave_pix": c, "nome_titular": t, "cidade_titular": ci}).eq("id", 1).execute()
+            st.success("Salvo com sucesso!")
